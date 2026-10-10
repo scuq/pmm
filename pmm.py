@@ -41,7 +41,7 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # GitHub repository that publishes releases of this script, as "owner/name".
 # Self-update is disabled while the owner is the placeholder "OWNER".
@@ -230,6 +230,8 @@ Rules
   and Consequences. Never edit an accepted decision; supersede it.
 - Keep NOW.md under %d lines. No session journal. Git holds the history.
 - When the work is done, report in at most three lines.
+- Single words from the user: "next" means run `pmm brief --files` and do
+  that task. "done" means `pmm done ID`. "status" means `pmm board`.
 """ % MAX_NOW_LINES
 
 
@@ -251,6 +253,9 @@ HOOKS_SNIPPET = {
 
 
 SKILL_PATH = ".claude/skills/pmm/SKILL.md"
+SETTINGS_PATH = ".claude/settings.json"
+AGENT_FILES = ("CLAUDE.md", "AGENTS.md")
+BLOCK_MARK = "## Project memory"
 
 # A Claude Code skill for explicit commands: /pmm ID, /pmm new WORDS.
 # It is user-only, so it costs no context in sessions that do not use it.
@@ -657,6 +662,54 @@ def block(record: dict) -> str:
 # --------------------------------------------------------------------------
 
 
+def detect_test(root: Path) -> str:
+    """Return a test command for the files in root, or an empty string."""
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    if (root / "Cargo.toml").is_file():
+        return "cargo test"
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            if json.loads(read_text(package)).get("scripts", {}).get("test"):
+                return "npm test"
+        except (ValueError, AttributeError):
+            pass
+    if (root / "pytest.ini").is_file() or (root / "conftest.py").is_file():
+        return "python3 -m pytest -q"
+    if list((root / "tests").glob("test_*.py")) or list(root.glob("test_*.py")):
+        return "python3 -m unittest -q"
+    makefile = root / "Makefile"
+    if makefile.is_file() and re.search(r"^test:", read_text(makefile), re.M):
+        return "make test"
+    return ""
+
+
+def merge_hooks(path: Path) -> bool:
+    """Add the pmm hooks to a Claude Code settings file. Return True on change."""
+    data = {}
+    if path.is_file():
+        try:
+            data = json.loads(read_text(path))
+        except ValueError:
+            raise PmmError("%s is not valid JSON. Add the hooks by hand: pmm instruct --hooks" % path) from None
+        if not isinstance(data, dict):
+            raise PmmError("%s does not hold a JSON object" % path)
+    hooks = data.setdefault("hooks", {})
+    changed = False
+    for event, groups in HOOKS_SNIPPET["hooks"].items():
+        existing = hooks.setdefault(event, [])
+        present = any(".project/pmm" in hook.get("command", "")
+                      for group in existing for hook in group.get("hooks", []))
+        if not present:
+            existing.extend(groups)
+            changed = True
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"), 0o644)
+    return changed
+
+
 def cmd_init(args) -> int:
     top = find_up(Path.cwd(), ".git")
     root = top if top is not None else Path.cwd().resolve()
@@ -670,7 +723,11 @@ def cmd_init(args) -> int:
     config = project / CONFIG_NAME
     if not config.exists():
         found = [name for name in ALWAYS_READ_CANDIDATES if (root / name).is_file()]
-        atomic_write(config, (CONFIG_TEMPLATE % ", ".join(found)).encode("utf-8"), 0o644)
+        text = CONFIG_TEMPLATE % ", ".join(found)
+        test = detect_test(root)
+        text = text.replace("test: \n", "test: %s\n" % test)
+        atomic_write(config, text.encode("utf-8"), 0o644)
+        print("test command: %s" % (test or "none found, set 'test:' in %s/%s" % (PROJECT_DIR, CONFIG_NAME)))
 
     source = Path(__file__).resolve()
     target = project / SCRIPT_NAME
@@ -681,12 +738,33 @@ def cmd_init(args) -> int:
             atomic_write(target, source.read_bytes(), 0o755)
             print("copied pmm %s to %s" % (__version__, rel(target, root)))
     print("initialized %s" % rel(project, root))
-    print()
-    print("Add this to AGENTS.md or CLAUDE.md (print it again with: pmm instruct):")
-    print()
-    print(AGENTS_SNIPPET, end="")
-    print()
-    print("Optional for Claude Code: pmm instruct --hooks (settings.json), pmm instruct --skill (/pmm command)")
+    if args.bare:
+        print("Agent files skipped. The block: pmm instruct")
+        return 0
+
+    # The instruction block goes into the first agent file that exists.
+    # Without one, CLAUDE.md is created.
+    agent = next((root / name for name in AGENT_FILES if (root / name).is_file()), None)
+    if agent is None:
+        agent = root / AGENT_FILES[0]
+        atomic_write(agent, ("# %s\n\n%s" % (root.name, AGENTS_SNIPPET)).encode("utf-8"), 0o644)
+        print("created %s with the project memory block" % agent.name)
+    elif BLOCK_MARK not in read_text(agent):
+        text = read_text(agent).rstrip("\n") + "\n\n" + AGENTS_SNIPPET
+        atomic_write(agent, text.encode("utf-8"), 0o644)
+        print("added the project memory block to %s" % agent.name)
+    else:
+        print("%s has the project memory block already" % agent.name)
+
+    if agent.name == "CLAUDE.md" or (root / ".claude").is_dir():
+        skill = root / SKILL_PATH
+        if not (skill.is_file() and read_text(skill) == SKILL_TEXT):
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(skill, SKILL_TEXT.encode("utf-8"), 0o644)
+            print("wrote %s (/pmm command)" % SKILL_PATH)
+        if merge_hooks(root / SETTINGS_PATH):
+            print("added hooks to %s" % SETTINGS_PATH)
+    print("Next: pmm add \"first task\" --now, then commit %s, %s and .claude/" % (PROJECT_DIR, agent.name))
     return 0
 
 
@@ -1163,17 +1241,10 @@ def normalize_word(word: str) -> str:
     return word
 
 
-def cmd_where(args) -> int:
-    """Print the place for a new piece of knowledge.
-
-    Without words, print the full table. With words, print the best
-    match. Several places with the same score are all printed.
-    """
-    words = {normalize_word(w) for arg in args.words for w in arg.split()}
+def match_places(text_words) -> list:
+    """Return the places that match the words best, or an empty list."""
+    words = {normalize_word(w) for arg in text_words for w in arg.split()}
     words.discard("")
-    if not words:
-        print("\n\n".join(place_text(place, True) for place in PLACES))
-        return 0
     scored = []
     for place in PLACES:
         vocabulary = {normalize_word(w) for w in place["words"]} | {place["name"]}
@@ -1181,14 +1252,89 @@ def cmd_where(args) -> int:
         if score:
             scored.append((score, place))
     if not scored:
-        print("no match for: %s. Pick one:" % " ".join(sorted(words)), file=sys.stderr)
+        return []
+    best = max(score for score, _ in scored)
+    return [place for score, place in scored if score == best]
+
+
+def cmd_where(args) -> int:
+    """Print the place for a new piece of knowledge.
+
+    Without words, print the full table. With words, print the best
+    match. Several places with the same score are all printed.
+    """
+    if not any(arg.strip() for arg in args.words):
+        print("\n\n".join(place_text(place, True) for place in PLACES))
+        return 0
+    hits = match_places(args.words)
+    if not hits:
+        print("no match for: %s. Pick one:" % " ".join(args.words), file=sys.stderr)
         print("\n".join(place_text(place, False) for place in PLACES))
         return 1
-    best = max(score for score, _ in scored)
-    hits = [place for score, place in scored if score == best]
     if len(hits) > 1:
         print("ambiguous: %s" % ", ".join(place["name"] for place in hits), file=sys.stderr)
     print("\n\n".join(place_text(place, True) for place in hits))
+    return 0
+
+
+def cmd_add(args) -> int:
+    """Create a record from plain words. The kind comes from the words.
+
+    Words that name no kind become an idea, the cheap catch-all.
+    """
+    root = find_root()
+    title = check_title(" ".join(args.words))
+    title = title[0].upper() + title[1:]
+    if args.kind:
+        kind = normalize_kind(args.kind)
+    else:
+        hits = [place for place in match_places(args.words) if place["name"] in KINDS]
+        kind = hits[0]["name"] if len(hits) == 1 else "idea"
+    new_args = argparse.Namespace(kind=kind, title=title, status=None, phase=None, tags=None,
+                                  decisions=None, files=None, section=None)
+    cmd_new(new_args)
+    records = load_records(root)
+    index = index_by_id(records)
+    record = max((r for r in records if r["kind"] == kind), key=lambda r: r["meta"].get("id", ""))
+    record_id = record["meta"]["id"]
+    if kind == "idea" and not args.kind:
+        print("stored as an idea. Another kind: pmm add --kind feature ...")
+    if args.now:
+        print(set_focus(root, index, record_id, ""))
+    elif args.next:
+        head, sections = read_now(root)
+        sections["Next"].append("- %s %s" % (record_id, title))
+        write_now(root, head, sections)
+        print("queued under Next")
+    return 0
+
+
+def cmd_board(args) -> int:
+    """Print one screen: focus, next, blockers, and counts per phase."""
+    root = find_root()
+    records = load_records(root)
+    head, sections = read_now(root)
+    for name in NOW_SECTIONS:
+        lines = [line for line in sections[name] if line.strip()]
+        print("%s:" % name)
+        print("\n".join(lines) if lines else "- none")
+    phases = [r for r in records if r["kind"] == "phase"]
+    features = [r for r in records if r["kind"] == "feature"]
+    if phases:
+        print()
+        print("%-24s %8s %12s %6s" % ("Phase", "planned", "in_progress", "done"))
+        for phase in phases:
+            pid = phase["meta"].get("id", "")
+            mine = [f for f in features if f["meta"].get("phase") == pid]
+            counts = {name: sum(1 for f in mine if f["meta"].get("status") == name)
+                      for name in ("planned", "in_progress", "done")}
+            label = "%s %s" % (pid, phase["meta"].get("title", ""))
+            marker = "*" if phase["meta"].get("status") == "in_progress" else " "
+            print("%s%-23s %8d %12d %6d" % (marker, label[:23], counts["planned"], counts["in_progress"], counts["done"]))
+    ideas = sum(1 for r in records if r["kind"] == "idea" and r["meta"].get("status") == "open")
+    proposed = sum(1 for r in records if r["kind"] == "decision" and r["meta"].get("status") == "proposed")
+    print()
+    print("Ideas open: %d   Decisions proposed: %d   Records: %d" % (ideas, proposed, len(records)))
     return 0
 
 
@@ -1615,11 +1761,22 @@ def cmd_version(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pmm", description="Project memory manager.")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
-    commands.required = True
+    commands.required = False
 
     sub = commands.add_parser("init", help="create .project/ and copy pmm into it")
     sub.add_argument("--force", action="store_true", help="replace an existing .project/pmm")
+    sub.add_argument("--bare", action="store_true", help="records only; no CLAUDE.md, skill or hooks")
     sub.set_defaults(func=cmd_init)
+
+    sub = commands.add_parser("add", help="create a record from plain words; the kind is detected")
+    sub.add_argument("words", nargs="+")
+    sub.add_argument("--kind", help="feature, decision, phase or idea")
+    sub.add_argument("--now", action="store_true", help="make it the focus")
+    sub.add_argument("--next", action="store_true", help="queue it under Next")
+    sub.set_defaults(func=cmd_add)
+
+    sub = commands.add_parser("board", help="one screen: focus, next, blockers, counts (default)")
+    sub.set_defaults(func=cmd_board)
 
     sub = commands.add_parser("status", help="show work in progress and NOW.md")
     sub.set_defaults(func=cmd_status)
@@ -1728,6 +1885,8 @@ def main(argv: list[str]) -> int:
     if argv[:1] == ["--instruct"]:
         argv = ["instruct"] + argv[1:]
     args = build_parser().parse_args(argv)
+    if args.command is None:
+        args.func = cmd_board
     try:
         code = args.func(args)
     except PmmError as exc:
