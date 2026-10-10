@@ -9,14 +9,15 @@ It answers the agent in one call, decides where a new record goes, and checks ev
     python3 .project/pmm COMMAND [ARGS]
 
     pmm brief [ID|TITLE WORDS] [--files]   everything for one task, one call
-    pmm done ID [ACCEPTANCE]               test, close, check, and commit a feature
+    pmm done ID [ACCEPTANCE]               test, close, check, commit, and advance the focus
+    pmm focus [ID]                         show or set the planned task in NOW.md
     pmm where WORDS                        where a new idea, feature, decision, or note goes
     pmm status                             work in progress and NOW.md
     pmm new KIND "Title" [-s Name=text]    create a record from a template
     pmm set ID key=value                   change a frontmatter field
     pmm write ID Section "text"            replace the text of a body section
     pmm check [--strict]                   check all records
-    pmm instruct [--hooks]                 the block for CLAUDE.md, or the hooks
+    pmm instruct [--hooks|--skill]         the block for CLAUDE.md, the hooks, or the skill
 
 Run `python3 .project/pmm --help` for the full list.
 
@@ -35,6 +36,12 @@ The output holds the record, the decisions it links to, the phase, the related o
 With `--files`, the contents of those files follow in the same output.
 The agent then makes all edits in one call and finishes with `pmm done`.
 That command runs the tests, writes the acceptance text, sets the status to done, checks all records, and commits as `ID: title`.
+
+`.project/NOW.md` holds the queue.
+The first record id under `Focus:` is the planned task.
+`pmm brief` with no id takes it, and the Claude Code hook puts it into the context at session start.
+`pmm focus ID` makes another record the focus and moves the old one to the top of `Next:`.
+When `pmm done` closes the focus, it pulls the first id under `Next:` up, so the queue advances without an edit.
 
 pmm is one Python file.
 It uses only the standard library and runs on Python 3.9 or later.
@@ -75,11 +82,19 @@ Then connect the agent:
 
    If `.claude/settings.json` exists, copy the `hooks` object into it by hand.
 
-3. Set the test command in `.project/config`, so that `pmm done` can run it:
+3. Optional, Claude Code only: install the `/pmm` command.
+   `/pmm F012` implements a record, `/pmm new WORDS` records new knowledge, and `/pmm` alone takes the focus.
+   The skill is user-invoked only, so it costs no context in a session that does not use it.
+
+       python3 .project/pmm instruct --skill
+
+4. Set the test command in `.project/config`, so that `pmm done` can run it:
 
        test: python3 -m unittest -q
 
-4. Commit `.project/` and the instruction file.
+5. Write the first task into `.project/NOW.md` under `Focus:`, with its record id first, or run `pmm focus ID`.
+
+6. Commit `.project/`, the instruction file, and `.claude/` if you created it.
 
 ## Configuration
 
@@ -102,7 +117,8 @@ Then connect the agent:
 
 ## Files
 
-- `.project/NOW.md`: The current focus, the next steps, and the blockers. Keep it under 40 lines.
+- `.project/NOW.md`: The sections `Focus:`, `Next:`, and `Blockers:`, one list item per line. Keep it under 40 lines.
+- `.claude/skills/pmm/SKILL.md`: The `/pmm` command, written by `instruct --skill`.
 - `.project/config`: The settings described above.
 - `.project/features/F001-slug.md`, `.project/decisions/ADR-001-slug.md`, `.project/phases/P01-slug.md`, `.project/ideas/I001-slug.md`: The records.
 - `.project/pmm`: The committed copy of the script.
