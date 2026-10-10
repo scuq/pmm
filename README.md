@@ -27,7 +27,7 @@ Latest release, the version that self-update installs:
 
     https://github.com/scuq/pmm/releases/latest/download/pmm.py
 
-Newest commit on main, before it is released:
+Newest commit on main, ahead of the release:
 
     https://raw.githubusercontent.com/scuq/pmm/main/pmm.py
 
