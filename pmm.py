@@ -41,7 +41,7 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # GitHub repository that publishes releases of this script, as "owner/name".
 # Self-update is disabled while the owner is the placeholder "OWNER".
@@ -213,6 +213,8 @@ directly only when pmm cannot answer.
 - Finish a feature: `pmm done ID "acceptance text"`, one call. It runs the
   tests, writes Acceptance, sets done, runs check and commits as "ID: title".
 - No record id yet: `pmm status`, then `pmm search TERM` or `pmm list`.
+- The next planned task: `pmm focus`. Switch: `pmm focus ID`. `done` moves
+  the focus to the first id under Next by itself.
 - A file that brief did not name: `pmm about PATH` before you change it.
 - New knowledge: run `pmm where WORDS` first, then the create command it
   prints. pmm decides the place. Do not choose or create a file yourself.
@@ -246,6 +248,37 @@ HOOKS_SNIPPET = {
         }],
     },
 }
+
+
+SKILL_PATH = ".claude/skills/pmm/SKILL.md"
+
+# A Claude Code skill for explicit commands: /pmm ID, /pmm new WORDS.
+# It is user-only, so it costs no context in sessions that do not use it.
+SKILL_TEXT = """\
+---
+name: pmm
+description: Work on a project memory record. /pmm ID or title words implements it. /pmm new WORDS records new knowledge. /pmm alone takes the planned focus.
+argument-hint: "[ID | title words | new WORDS]"
+disable-model-invocation: true
+---
+
+`pmm` means `python3 .project/pmm`. Arguments: $ARGUMENTS
+
+If the arguments start with `new`, go to step 5. Otherwise:
+
+1. Run `pmm brief $ARGUMENTS --files` (with no arguments it takes the focus).
+   If it reports several matches, pick the one the user meant and run it again with the id.
+2. Read the output once. Do not read records or the listed files again.
+3. Make every edit, code and docs alike, in one call. Run nothing before all edits are done.
+4. Finish. A feature: `pmm done ID "acceptance text"`. A decision: `pmm set ID status=accepted`.
+   An idea: `pmm set ID status=promoted promoted_to=F###` after the feature exists.
+   Report in three lines and stop.
+
+5. New knowledge: run `pmm where WORDS` with the words after `new`.
+   Run the create command it prints: a title of at most eight words, one `-s Name=text` per section,
+   and `--files` for a feature. If this is the next task, run `pmm focus ID`.
+   Report the id and the path in one line.
+"""
 
 
 class PmmError(Exception):
@@ -653,7 +686,7 @@ def cmd_init(args) -> int:
     print()
     print(AGENTS_SNIPPET, end="")
     print()
-    print("Optional Claude Code hooks for .claude/settings.json: pmm instruct --hooks")
+    print("Optional for Claude Code: pmm instruct --hooks (settings.json), pmm instruct --skill (/pmm command)")
     return 0
 
 
@@ -798,6 +831,105 @@ def now_focus(root: Path) -> str:
     return text.strip("\n")
 
 
+NOW_SECTIONS = ("Focus", "Next", "Blockers")
+FOCUS_ID_RE = re.compile(r"\b(ADR-\d{3,}|F\d{3,}|P\d{2,}|I\d{3,})\b")
+
+
+def read_now(root: Path) -> tuple:
+    """Return (head, sections) of NOW.md. sections maps a name to its lines."""
+    now = root / PROJECT_DIR / NOW_NAME
+    text = read_text(now) if now.is_file() else NOW_TEMPLATE
+    head = []
+    sections = {name: [] for name in NOW_SECTIONS}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        name = stripped[:-1].strip().capitalize() if stripped.endswith(":") else ""
+        if name in sections and not stripped.startswith("-"):
+            current = name
+            continue
+        if current is None:
+            head.append(line)
+        else:
+            sections[current].append(line)
+    return head, sections
+
+
+def write_now(root: Path, head: list, sections: dict) -> None:
+    lines = [line for line in head if line.strip()]
+    for name in NOW_SECTIONS:
+        body = [line for line in sections[name] if line.strip()]
+        lines += ["", name + ":"] + body
+    atomic_write(root / PROJECT_DIR / NOW_NAME, ("\n".join(lines).strip("\n") + "\n").encode("utf-8"), 0o644)
+
+
+def line_id(line: str) -> str:
+    match = FOCUS_ID_RE.search(line)
+    return match.group(1) if match else ""
+
+
+def set_focus(root: Path, index: dict, record_id: str, words: str) -> str:
+    """Make record_id the focus. The old focus moves to the top of Next."""
+    head, sections = read_now(root)
+    record = get_record(index, record_id)
+    if record["meta"].get("status") in CLOSED:
+        raise PmmError("%s is %s; focus on an open record" % (record_id, record["meta"]["status"]))
+    old = [line for line in sections["Focus"] if line.strip()]
+    sections["Next"] = [line for line in sections["Next"] if line_id(line) != record_id]
+    for line in reversed(old):
+        old_id = line_id(line)
+        if old_id and old_id != record_id and old_id in index \
+                and index[old_id]["meta"].get("status") not in CLOSED \
+                and all(line_id(n) != old_id for n in sections["Next"]):
+            sections["Next"].insert(0, line)
+    title = record["meta"].get("title", "")
+    sections["Focus"] = ["- %s %s%s" % (record_id, title, (". " + words) if words else "")]
+    write_now(root, head, sections)
+    return "focus: %s %s" % (record_id, title)
+
+
+def advance_focus(root: Path, index: dict, closed_id: str) -> str:
+    """After closed_id is done: drop it from Focus and pull the first Next id up."""
+    head, sections = read_now(root)
+    before = list(sections["Focus"])
+    sections["Focus"] = [line for line in sections["Focus"] if line_id(line) != closed_id]
+    sections["Next"] = [line for line in sections["Next"] if line_id(line) != closed_id]
+    if sections["Focus"] == before and not any(line_id(n) == closed_id for n in before):
+        return ""
+    if not [line for line in sections["Focus"] if line.strip()]:
+        for line in sections["Next"]:
+            next_id = line_id(line)
+            if next_id and next_id in index and index[next_id]["meta"].get("status") not in CLOSED:
+                sections["Next"].remove(line)
+                sections["Focus"] = [line]
+                write_now(root, head, sections)
+                return "focus is now %s %s" % (next_id, index[next_id]["meta"].get("title", ""))
+    write_now(root, head, sections)
+    return "focus is empty; set it with: pmm focus ID"
+
+
+def cmd_focus(args) -> int:
+    root = find_root()
+    records = load_records(root)
+    index = index_by_id(records)
+    if not args.id:
+        head, sections = read_now(root)
+        focus = [line for line in sections["Focus"] if line.strip()]
+        print("\n".join(focus) if focus else "focus is empty; set it with: pmm focus ID")
+        nxt = [line for line in sections["Next"] if line.strip()]
+        if nxt:
+            print("Next:\n" + "\n".join(nxt))
+        return 0
+    record_id = args.id
+    if kind_of_id(record_id) is None:
+        record_id = resolve_id(records, " ".join([args.id] + args.words))
+        words = ""
+    else:
+        words = " ".join(args.words)
+    print(set_focus(root, index, record_id, words))
+    return 0
+
+
 def rank(record: dict) -> int:
     order = {"in_progress": 0, "proposed": 1, "planned": 2, "accepted": 3, "open": 4}
     return order.get(record["meta"].get("status", ""), 9)
@@ -833,11 +965,10 @@ def cmd_brief(args) -> int:
     index = index_by_id(records)
     record_id = " ".join(args.id)
     if not record_id:
-        match = re.search(r"\b(ADR-\d{3,}|F\d{3,}|P\d{2,}|I\d{3,})\b", now_focus(root))
-        if match is None:
+        record_id = line_id(now_focus(root))
+        if not record_id:
             # No focus record. The status is the best one-call answer.
             return cmd_status(args)
-        record_id = match.group(1)
     elif kind_of_id(record_id) is None:
         record_id = resolve_id(records, record_id)
     record = get_record(index, record_id)
@@ -966,6 +1097,10 @@ def cmd_done(args) -> int:
     check_args = argparse.Namespace(strict=False, hook=False)
     if check_records(check_args) != 0:
         raise PmmError("check failed. The record is changed but not committed.")
+
+    note = advance_focus(root, index, args.id)
+    if note:
+        print(note)
 
     title = record["meta"].get("title", "")
     message = "%s: %s" % (args.id, args.message or title)
@@ -1325,6 +1460,16 @@ def cmd_instruct(args) -> int:
     if args.hooks:
         print(json.dumps(HOOKS_SNIPPET, indent=2))
         return 0
+    if args.skill:
+        root = find_root()
+        path = root / SKILL_PATH
+        if path.is_file() and read_text(path) == SKILL_TEXT:
+            print("unchanged %s" % SKILL_PATH)
+            return 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, SKILL_TEXT.encode("utf-8"), 0o644)
+        print("wrote %s. Use it as: /pmm ID, /pmm title words, /pmm new WORDS" % SKILL_PATH)
+        return 0
     print(AGENTS_SNIPPET, end="")
     return 0
 
@@ -1496,6 +1641,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--files", action="store_true", help="also print the contents of the files to read")
     sub.set_defaults(func=cmd_brief)
 
+    sub = commands.add_parser("focus", help="show or set the focus in NOW.md; done advances it")
+    sub.add_argument("id", nargs="?", help="an id or title words; the old focus moves to Next")
+    sub.add_argument("words", nargs="*", help="a short note after the title")
+    sub.set_defaults(func=cmd_focus)
+
     sub = commands.add_parser("done", help="finish a feature: test, acceptance, status, check, commit")
     sub.add_argument("id")
     sub.add_argument("acceptance", nargs="?", help="text for the Acceptance section; '-' reads stdin")
@@ -1561,6 +1711,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = commands.add_parser("instruct", help="print the block for AGENTS.md or CLAUDE.md")
     sub.add_argument("--hooks", action="store_true",
                      help="print Claude Code hooks for .claude/settings.json instead")
+    sub.add_argument("--skill", action="store_true",
+                     help="write the Claude Code skill to %s instead" % SKILL_PATH)
     sub.set_defaults(func=cmd_instruct)
 
     sub = commands.add_parser("self-update", help="install the latest release of pmm")
