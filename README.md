@@ -21,6 +21,20 @@ It answers the agent in one call, decides where a new record goes, and checks ev
 
 Run `python3 .project/pmm --help` for the full list.
 
+## Download
+
+Latest release, the version that self-update installs:
+
+    https://github.com/scuq/pmm/releases/latest/download/pmm.py
+
+Newest commit on main, before it is released:
+
+    https://raw.githubusercontent.com/scuq/pmm/main/pmm.py
+
+One line to put either one into a project:
+
+    curl -fsSLO https://github.com/scuq/pmm/releases/latest/download/pmm.py && python3 pmm.py init && rm pmm.py
+
 ## Description
 
 A long project collects decisions that an agent must follow and features that it must finish.
